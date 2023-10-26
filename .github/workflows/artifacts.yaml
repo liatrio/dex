@@ -168,7 +168,7 @@ jobs:
       #     retention-days: 5
 
       - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@41f05d9ecffa2ed3f1580af306000f734b733e54 # 0.11.2
+        uses: aquasecurity/trivy-action@b77b85c0254bba6789e787844f0585cde1e56320 # 0.13.0
         with:
           input: image
           format: sarif
