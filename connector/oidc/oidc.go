@@ -2,6 +2,7 @@
 package oidc
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,11 +13,14 @@ import (
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
-	"golang.org/x/oauth2"
-
 	"github.com/dexidp/dex/connector"
+	groups_pkg "github.com/dexidp/dex/pkg/groups"
 	"github.com/dexidp/dex/pkg/httpclient"
 	"github.com/dexidp/dex/pkg/log"
+	"golang.org/x/oauth2"
+
+	"github.com/open-policy-agent/opa/sdk"
+	sdktest "github.com/open-policy-agent/opa/sdk/test"
 )
 
 // Config holds configuration options for OpenID Connect logins.
@@ -25,6 +29,10 @@ type Config struct {
 	ClientID     string `json:"clientID"`
 	ClientSecret string `json:"clientSecret"`
 	RedirectURI  string `json:"redirectURI"`
+
+	// The section to override options discovered automatically from
+	// the providers' discovery URL (.well-known/openid-configuration).
+	ProviderDiscoveryOverrides ProviderDiscoveryOverrides `json:"providerDiscoveryOverrides"`
 
 	// Causes client_secret to be passed as POST parameters instead of basic
 	// auth. This is specifically "NOT RECOMMENDED" by the OAuth2 RFC, but some
@@ -50,7 +58,8 @@ type Config struct {
 	InsecureSkipEmailVerified bool `json:"insecureSkipEmailVerified"`
 
 	// InsecureEnableGroups enables groups claims. This is disabled by default until https://github.com/dexidp/dex/issues/1065 is resolved
-	InsecureEnableGroups bool `json:"insecureEnableGroups"`
+	InsecureEnableGroups bool     `json:"insecureEnableGroups"`
+	AllowedGroups        []string `json:"allowedGroups"`
 
 	// AcrValues (Authentication Context Class Reference Values) that specifies the Authentication Context Class Values
 	// within the Authentication Request that the Authorization Server is being requested to use for
@@ -70,7 +79,7 @@ type Config struct {
 	UserNameKey string `json:"userNameKey"`
 
 	// PromptType will be used fot the prompt parameter (when offline_access, by default prompt=consent)
-	PromptType string `json:"promptType"`
+	PromptType *string `json:"promptType"`
 
 	// OverrideClaimMapping will be used to override the options defined in claimMappings.
 	// i.e. if there are 'email' and `preferred_email` claims available, by default Dex will always use the `email` claim independent of the ClaimMapping.EmailKey.
@@ -87,6 +96,83 @@ type Config struct {
 		// Configurable key which contains the groups claims
 		GroupsKey string `json:"groups"` // defaults to "groups"
 	} `json:"claimMapping"`
+
+	TokenPolicy string `json:"policy.rego"`
+	// ClaimMutations holds all claim mutations options
+	ClaimMutations struct {
+		NewGroupFromClaims []NewGroupFromClaims `json:"newGroupFromClaims"`
+	} `json:"claimModifications"`
+}
+
+type ProviderDiscoveryOverrides struct {
+	// TokenURL provides a way to user overwrite the Token URL
+	// from the .well-known/openid-configuration token_endpoint
+	TokenURL string `json:"tokenURL"`
+	// AuthURL provides a way to user overwrite the Auth URL
+	// from the .well-known/openid-configuration authorization_endpoint
+	AuthURL string `json:"authURL"`
+}
+
+func (o *ProviderDiscoveryOverrides) Empty() bool {
+	return o.TokenURL == "" && o.AuthURL == ""
+}
+
+func getProvider(ctx context.Context, issuer string, overrides ProviderDiscoveryOverrides) (*oidc.Provider, error) {
+	provider, err := oidc.NewProvider(ctx, issuer)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get provider: %v", err)
+	}
+
+	if overrides.Empty() {
+		return provider, nil
+	}
+
+	v := &struct {
+		Issuer        string   `json:"issuer"`
+		AuthURL       string   `json:"authorization_endpoint"`
+		TokenURL      string   `json:"token_endpoint"`
+		DeviceAuthURL string   `json:"device_authorization_endpoint"`
+		JWKSURL       string   `json:"jwks_uri"`
+		UserInfoURL   string   `json:"userinfo_endpoint"`
+		Algorithms    []string `json:"id_token_signing_alg_values_supported"`
+	}{}
+	if err := provider.Claims(v); err != nil {
+		return nil, fmt.Errorf("failed to extract provider discovery claims: %v", err)
+	}
+	config := oidc.ProviderConfig{
+		IssuerURL:     v.Issuer,
+		AuthURL:       v.AuthURL,
+		TokenURL:      v.TokenURL,
+		DeviceAuthURL: v.DeviceAuthURL,
+		JWKSURL:       v.JWKSURL,
+		UserInfoURL:   v.UserInfoURL,
+		Algorithms:    v.Algorithms,
+	}
+
+	if overrides.TokenURL != "" {
+		config.TokenURL = overrides.TokenURL
+	}
+	if overrides.AuthURL != "" {
+		config.AuthURL = overrides.AuthURL
+	}
+
+	return config.NewProvider(context.Background()), nil
+}
+
+// NewGroupFromClaims creates a new group from a list of claims and appends it to the list of existing groups.
+type NewGroupFromClaims struct {
+	// List of claim to join together
+	Claims []string `json:"claims"`
+
+	// String to separate the claims
+	Delimiter string `json:"delimiter"`
+
+	// Should Dex remove the Delimiter string from claim values
+	// This is done to keep resulting claim structure in full control of the Dex operator
+	ClearDelimiter bool `json:"clearDelimiter"`
+
+	// String to place before the first claim
+	Prefix string `json:"prefix"`
 }
 
 // Domains that don't support basic auth. golang.org/x/oauth2 has an internal
@@ -100,6 +186,7 @@ var brokenAuthHeaderDomains = []string{
 // connectorData stores information for sessions authenticated by this connector
 type connectorData struct {
 	RefreshToken []byte
+	Claims       map[string]interface{}
 }
 
 // Detect auth header provider issues for known providers. This lets users
@@ -129,13 +216,16 @@ func (c *Config) Open(id string, logger log.Logger) (conn connector.Connector, e
 		return nil, err
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	ctx = context.WithValue(ctx, oauth2.HTTPClient, httpClient)
+	bgctx, cancel := context.WithCancel(context.Background())
+	ctx := context.WithValue(bgctx, oauth2.HTTPClient, httpClient)
 
-	provider, err := oidc.NewProvider(ctx, c.Issuer)
+	provider, err := getProvider(ctx, c.Issuer, c.ProviderDiscoveryOverrides)
 	if err != nil {
 		cancel()
-		return nil, fmt.Errorf("failed to get provider: %v", err)
+		return nil, err
+	}
+	if !c.ProviderDiscoveryOverrides.Empty() {
+		logger.Warnf("overrides for connector %q are set, this can be a vulnerability when not properly configured", id)
 	}
 
 	endpoint := provider.Endpoint()
@@ -157,8 +247,9 @@ func (c *Config) Open(id string, logger log.Logger) (conn connector.Connector, e
 	}
 
 	// PromptType should be "consent" by default, if not set
-	if c.PromptType == "" {
-		c.PromptType = "consent"
+	promptType := "consent"
+	if c.PromptType != nil {
+		promptType = *c.PromptType
 	}
 
 	clientID := c.ClientID
@@ -180,15 +271,18 @@ func (c *Config) Open(id string, logger log.Logger) (conn connector.Connector, e
 		httpClient:                httpClient,
 		insecureSkipEmailVerified: c.InsecureSkipEmailVerified,
 		insecureEnableGroups:      c.InsecureEnableGroups,
+		allowedGroups:             c.AllowedGroups,
 		acrValues:                 c.AcrValues,
 		getUserInfo:               c.GetUserInfo,
-		promptType:                c.PromptType,
+		promptType:                promptType,
 		userIDKey:                 c.UserIDKey,
 		userNameKey:               c.UserNameKey,
 		overrideClaimMapping:      c.OverrideClaimMapping,
 		preferredUsernameKey:      c.ClaimMapping.PreferredUsernameKey,
 		emailKey:                  c.ClaimMapping.EmailKey,
 		groupsKey:                 c.ClaimMapping.GroupsKey,
+		TokenPolicy:               c.TokenPolicy,
+		newGroupFromClaims:        c.ClaimMutations.NewGroupFromClaims,
 	}, nil
 }
 
@@ -207,6 +301,7 @@ type oidcConnector struct {
 	httpClient                *http.Client
 	insecureSkipEmailVerified bool
 	insecureEnableGroups      bool
+	allowedGroups             []string
 	acrValues                 []string
 	getUserInfo               bool
 	promptType                string
@@ -216,6 +311,8 @@ type oidcConnector struct {
 	preferredUsernameKey      string
 	emailKey                  string
 	groupsKey                 string
+	TokenPolicy               string
+	newGroupFromClaims        []NewGroupFromClaims
 }
 
 func (c *oidcConnector) Close() error {
@@ -344,7 +441,10 @@ func (c *oidcConnector) createIdentity(ctx context.Context, identity connector.I
 	// We immediately want to run getUserInfo if configured before we validate the claims.
 	// For token exchanges with access tokens, this is how we verify the token.
 	if c.getUserInfo {
-		userInfo, err := c.provider.UserInfo(ctx, oauth2.StaticTokenSource(token))
+		userInfo, err := c.provider.UserInfo(ctx, oauth2.StaticTokenSource(&oauth2.Token{
+			AccessToken: token.AccessToken,
+			TokenType:   "Bearer", // The UserInfo endpoint requires a bearer token as per RFC6750
+		}))
 		if err != nil {
 			return identity, fmt.Errorf("oidc: error loading userinfo: %v", err)
 		}
@@ -425,10 +525,47 @@ func (c *oidcConnector) createIdentity(ctx context.Context, identity connector.I
 				}
 			}
 		}
+
+		// Validate that the user is part of allowedGroups
+		if len(c.allowedGroups) > 0 {
+			groupMatches := groups_pkg.Filter(groups, c.allowedGroups)
+
+			if len(groupMatches) == 0 {
+				// No group membership matches found, disallowing
+				return identity, fmt.Errorf("user not a member of allowed groups")
+			}
+
+			groups = groupMatches
+		}
+	}
+
+	for _, config := range c.newGroupFromClaims {
+		newGroupSegments := []string{
+			config.Prefix,
+		}
+		for _, claimName := range config.Claims {
+			claimValue, ok := claims[claimName].(string)
+			if !ok { // Non string claim value are ignored, concatenating them doesn't really make any sense
+				continue
+			}
+
+			if config.ClearDelimiter {
+				// Removing the delimiter string from the concatenated claim to ensure resulting claim structure
+				// is in full control of Dex operator
+				claimValue = strings.ReplaceAll(claimValue, config.Delimiter, "")
+			}
+
+			newGroupSegments = append(newGroupSegments, claimValue)
+		}
+
+		if len(newGroupSegments) > 1 {
+			groups = append(groups, strings.Join(newGroupSegments, config.Delimiter))
+		}
 	}
 
 	cd := connectorData{
 		RefreshToken: []byte(token.RefreshToken),
+		Claims:       claims,
 	}
 
 	connData, err := json.Marshal(&cd)
@@ -456,3 +593,140 @@ func (c *oidcConnector) createIdentity(ctx context.Context, identity connector.I
 
 	return identity, nil
 }
+
+type Result struct {
+	Allow bool                   `json:"allow"`
+	Token map[string]interface{} `json:"token"`
+}
+
+func (c *oidcConnector) ExtendPayload(scopes []string, payload []byte, cdata []byte) ([]byte, error) {
+
+	// No-op
+	if c.TokenPolicy == "" {
+		return payload, nil
+	}
+
+	ctx := context.Background()
+
+	// create a mock HTTP bundle server
+	server, err := sdktest.NewServer(sdktest.MockBundle("/bundles/bundle.tar.gz", map[string]string{
+		"policy.rego": c.TokenPolicy,
+	}))
+	if err != nil {
+		return nil, err
+	}
+
+	defer server.Stop()
+
+	// provide the OPA configuration which specifies
+	// fetching policy bundles from the mock server
+	// and logging decisions locally to the console
+	config := []byte(fmt.Sprintf(`{
+		"services": {
+			"test": {
+				"url": %q
+			}
+		},
+		"bundles": {
+			"test": {
+				"resource": "/bundles/bundle.tar.gz"
+			}
+		},
+		"decision_logs": {
+			"console": true
+		}
+	}`, server.URL()))
+
+	// create an instance of the OPA object
+	opa, err := sdk.New(ctx, sdk.Options{
+		ID:     "opa-token-evaluate",
+		Config: bytes.NewReader(config),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	defer opa.Stop(ctx)
+
+	// Evaluate inputs
+	var cd connectorData
+	var claims map[string]interface{}
+
+	c.logger.Info("ExtendPayload called")
+
+	if err := json.Unmarshal(cdata, &cd); err != nil {
+		return payload, err
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return payload, err
+	}
+
+	// get the named policy decision for the specified input
+	result, err := opa.Decision(ctx, sdk.DecisionOptions{Path: "/token/result", Input: map[string]interface{}{"token": claims, "claims": cd.Claims}})
+	if err != nil {
+		return nil, err
+	}
+
+	v, ok := result.Result.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("denied")
+	}
+
+	r := Result{
+		Allow: v["allow"].(bool),
+		Token: v["token"].(map[string]interface{}),
+	}
+
+	if !ok || !r.Allow {
+		return nil, fmt.Errorf("denied")
+	}
+
+	// these need to be floats, not json.Numbers
+	for _, key := range []string{"iat", "exp", "nbf"} {
+		if _, ok := r.Token[key]; ok {
+			if vv, ok := claims[key]; ok {
+				r.Token[key] = vv
+			} else {
+				delete(r.Token, key)
+			}
+		}
+	}
+
+	output, err := json.Marshal(&r.Token)
+
+	return output, err
+}
+
+//type jsonTime time.Time
+//
+//type tokenTimes struct {
+//	Iat jsonTime `json:"iat"`
+//	Exp jsonTime `json:"exp"`
+//	Nbf jsonTime `json:"nbf"`
+//}
+//
+//func (j *jsonTime) MarshalJSON() ([]byte, error) {
+//	t := time.Time(*j)
+//	return json.Marshal(t.Unix())
+//}
+//
+//func (j *jsonTime) UnmarshalJSON(b []byte) error {
+//	var n json.Number
+//	if err := json.Unmarshal(b, &n); err != nil {
+//		return err
+//	}
+//	var unix int64
+//
+//	if t, err := n.Int64(); err == nil {
+//		unix = t
+//	} else {
+//		f, err := n.Float64()
+//		if err != nil {
+//			return err
+//		}
+//		unix = int64(f)
+//	}
+//	*j = jsonTime(time.Unix(unix, 0))
+//	return nil
+//}
+//
